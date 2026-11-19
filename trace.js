@@ -262,7 +262,32 @@ function tracingFilter(renderer) {
   };
 }
 
-function sceneSnapshot(source, groupCache) {
+// Keep the order of material slots already encoded in the acceleration structure
+// when a paint, fabric or lamp changes. Volume and visibility edits need new geometry.
+function geometryState(geometry) {
+  const result=[];
+  for(const a of [geometry.index,...Object.values(geometry.attributes)])result.push(a,a?.version??0);
+  return result;
+}
+function updateAppearance(engine,previous,next,camera) {
+  if(!previous||previous.meshes.size!==next.meshes.size)return false;
+  const mapping=new Map();
+  for(const [id,old] of previous.meshes){
+    const row=next.meshes.get(id);
+    if(!row||row.mesh.geometry!==old.mesh.geometry||!row.mesh.matrix.equals(old.mesh.matrix)||
+        old.attributes.length!==row.attributes.length||old.attributes.some((v,i)=>v!==row.attributes[i]))return false;
+    mapping.set(old.mesh.material,row.mesh.material);
+  }
+  const materials=engine._materials.map(m=>mapping.get(m));
+  if(materials.some(m=>!m))return false;
+  engine._materials=materials;
+  engine.scene=next.scene;
+  engine.setCamera(camera);
+  engine.updateMaterials();engine.updateLights();engine.updateEnvironment();
+  return true;
+}
+
+function sceneSnapshot(source, groupCache, previous) {
   source.updateMatrixWorld(true);
   const output = new THREE.Scene();
   const guide = new THREE.Scene();
@@ -272,7 +297,7 @@ function sceneSnapshot(source, groupCache) {
   output.backgroundRotation.copy(source.backgroundRotation);
   output.environmentRotation.copy(source.environmentRotation);
   const hemis = [], ambient = new THREE.Color(0);
-  const ownedMaterials = [];
+  const ownedMaterials = [], meshes = new Map();
   const localMatrix = new THREE.Matrix4(), worldMatrix = new THREE.Matrix4();
   source.traverseVisible(node => {
     if (node.userData.eyeLevelOnly) eyeEnclosure = true;
@@ -313,6 +338,7 @@ function sceneSnapshot(source, groupCache) {
         }
         copy.matrix.copy(worldMatrix);
         output.add(copy);
+        meshes.set(copy.uuid,{mesh:copy,attributes:geometryState(geometry)});
         if (!(mat.transmission > .8)) {
           const ink = guideMaterial(mat);
           ownedMaterials.push(ink);
@@ -325,12 +351,16 @@ function sceneSnapshot(source, groupCache) {
     }
   });
   if (eyeEnclosure && streetLight?.intensity > 0) addWindowDaylight(output,streetLight);
-  output.environment = environmentFor(source, hemis, ambient);
+  const envKey=[source.environment?.uuid,source.environment?.version,source.environmentIntensity,
+    ...source.environmentRotation.toArray(),...ambient.toArray(),...hemis.flatMap(h=>[
+      h.intensity,...h.color.toArray(),...h.groundColor.toArray(),...h.matrixWorld.elements
+    ])].join('|');
+  output.environment = previous?.envKey===envKey?previous.scene.environment:environmentFor(source, hemis, ambient);
   output.environmentIntensity = 1;
   output.updateMatrixWorld(true);
-  return { scene: output, guide, dispose() {
+  return { scene: output, guide, meshes, envKey, dispose(keepEnvironment=null) {
     ownedMaterials.forEach(m => m.dispose());
-    output.environment.dispose();
+    if(output.environment!==keepEnvironment)output.environment.dispose();
     output.clear();
     guide.clear();
   }};
@@ -397,14 +427,16 @@ export function createTrace(renderer, scene, cameraGetter, report = () => {}, on
       size();
       const updateGuide = changed || cameraDirty || !snapshot;
       if (changed || !snapshot) {
-        const next = sceneSnapshot(scene,groupCache);
+        const next = sceneSnapshot(scene,groupCache,snapshot);
         try {
           // The pinned generator appends groups on update. Start each merge
           // cleanly so switching between lighting schemes cannot retain parts.
-          engine._generator.geometry.clearGroups();
-          engine.setScene(next.scene,cameraGetter());
-        } catch (error) { next.dispose(); throw error; }
-        snapshot?.dispose();
+          if(!updateAppearance(engine,snapshot,next,cameraGetter())){
+            engine._generator.geometry.clearGroups();
+            engine.setScene(next.scene,cameraGetter());
+          }
+        } catch (error) { next.dispose(snapshot?.scene.environment); throw error; }
+        snapshot?.dispose(next.scene.environment);
         snapshot = next;
         changed = false;
         cameraDirty = false;

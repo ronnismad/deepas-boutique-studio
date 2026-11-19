@@ -1,7 +1,10 @@
-import {finishOptions} from './finishes.js';
+import {defaults,validState,groups,catalog,ranges} from './choices.js';
+import {initDesigns,historyControls} from './design-tools.js';
+export {defaults,validState};
 import {lightingOptions} from './lighting.js';
 export const $=id=>document.getElementById(id);
 const icons={
+ undo:'M4 10h9a6 6 0 0 1 0 12M4 10l5-5m-5 5 5 5',redo:'M20 10h-9a6 6 0 0 0 0 12m9-12-5-5m5 5-5 5',
  plus:'M12 5v14m-7-7h14',minus:'M5 12h14',reset:'M4 11a8 8 0 1 1 2 6M4 5v6h6',
  download:'M12 3v12m-5-5 5 5 5-5M4 16v4h16v-4',bookmark:'M6 3h12v18l-6-4-6 4z',
  cut:'M3 9l9-5 9 5-9 5zm0 0v8l9 5 9-5V9m-9 5v8',shop:'M3 7h18l-2-4H5zm1 1v12h16V8M7 12h4v8m3-8h3v4h-3z',
@@ -10,85 +13,126 @@ const icons={
 };
 function icon(key){const NS='http://www.w3.org/2000/svg';const svg=document.createElementNS(NS,'svg');svg.setAttribute('viewBox','0 0 24 24');svg.classList.add('ico');svg.setAttribute('aria-hidden','true');const p=document.createElementNS(NS,'path');p.setAttribute('d',icons[key]);svg.append(p);return svg;}
 const cameraViews=[['cutaway','Cutaway','cut'],['front','Entrance','shop'],['aisle','Inside','aisle'],['rear','Reverse','rear'],['plan','Plan','plan']];
-export const defaults={floor:'limestone',wall:'sage',wood:'walnut',light:'cove',kelvin:3500,intensity:100,shelf:75,daylight:50,customWall:'#a0aa8d',customCompanion:'#efe7d8'};
-const ranges=[['kelvin','Colour temperature',2300,7500,100,' K'],['intensity','Fixture brightness',0,150,1,'%'],['shelf','Shelf glow',0,100,1,'%'],['daylight','Daylight',0,100,1,'%']];
-const presets=[
- ['Daylight & sage','diffuse',{light:'cove',kelvin:3500,daylight:70,shelf:70}],
- ['Evening display','track',{light:'track',kelvin:3000,daylight:12,shelf:82,intensity:112}],
- ['Muted rose','rose',{wall:'rose',light:'recessed',kelvin:3300}],
- ['Terracotta','oxide',{floor:'oxide',light:'recessed',kelvin:3300,shelf:78}],
- ['Peacock teal','teal',{wall:'teal',light:'recessed',kelvin:3500}],
- ['Cream terrazzo','terrazzo',{floor:'terrazzo',light:'cove',kelvin:3700}]
-];
-const key='boutique-studio-designs-v2';
-const arrayFor={floor:finishOptions.floors,wall:finishOptions.walls,wood:finishOptions.woods,light:lightingOptions};
-export function validState(raw={}){
- const result={...defaults};
- for(const [prop,list] of Object.entries(arrayFor)){
-   if(list.some(x=>x.id===raw[prop])||(prop==='wall'&&raw.wall==='custom'))result[prop]=raw[prop];
- }
- for(const [prop,,min,max,step] of ranges){if(Number.isFinite(raw[prop]))result[prop]=Math.min(max,Math.max(min,Math.round(raw[prop]/step)*step));}
- for(const prop of ['customWall','customCompanion'])if(/^#[0-9a-f]{6}$/i.test(raw[prop]||''))result[prop]=raw[prop];
- return result;
-}
 let toastTimer;
 export function toast(message){const e=$('toast');e.textContent=message;e.hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>e.hidden=true,3400);}
 function el(tag,cls,txt){const a=document.createElement(tag);if(cls)a.className=cls;if(txt)a.textContent=txt;return a;}
 function btn(cls,txt,fn){const b=el('button',cls,txt);b.type='button';b.addEventListener('click',fn);return b;}
-function titleGroup(name){const t=el('div','group-title');t.append(el('h2','',name));return t;}
 function option(select,value,label){const o=el('option','',label);o.value=value;select.append(o);}
-export function initUI(api){
- document.querySelectorAll('[data-icon]').forEach(node=>node.replaceWith(icon(node.dataset.icon)));
- const bind={};
- for(const [kind,groupName] of [['floor','Floor'],['wall','Wall palette'],['wood','Timber']]){
-  const list=arrayFor[kind],section=el('div','group'),title=titleGroup(groupName),value=el('span','value');
-  title.append(value);section.append(title);
-  const chips=el('div','swatches');chips.dataset.kind=kind;chips.setAttribute('role','group');chips.setAttribute('aria-label',groupName);
-  for(const item of list){const b=btn('chip','',()=>api.change({[kind]:item.id}));b.setAttribute('aria-label',item.label);b.dataset.id=item.id;
-   if(item.preview)b.style.backgroundImage='url("'+item.preview+'")';else b.style.background=item.swatch;b.title=item.label;chips.append(b);}
-  const select=el('select','selectbox');select.id=kind;select.setAttribute('aria-label',groupName);
-  for(const item of list)option(select,item.id,item.label);if(kind==='wall')option(select,'custom','Custom colours');
-  select.onchange=()=>api.change({[kind]:select.value});section.append(chips,select);
-  if(kind==='wall'){
-   const row=el('div','custom-paints');
-   for(const [prop,label] of [['customWall','Accent'],['customCompanion','Companion']]){
-    const e=el('label','',label);
-    const c=el('input');c.id=prop;c.type='color';c.title='Choose '+label.toLowerCase()+' paint colour';c.addEventListener('input',()=>api.change({wall:'custom',customWall:$('customWall').value,customCompanion:$('customCompanion').value}));e.prepend(c);row.append(e);
-   }section.append(row);
+const detailsViews=[['display','Saree display'],['till','Cash counter'],['arch','Arch & transom'],['mezzanine','Mezzanine doorway'],['showcase','Window mannequins']];
+function bindTabs(){
+  const ids=['finishes','display','lighting','looks'];
+  function active(key){
+    for(const id of ids){
+      const show=id===key,b=$('tab-'+id);b.setAttribute('aria-selected',String(show));b.tabIndex=show?0:-1;$('panel-'+id).hidden=!show;
+    }
   }
-  $('finish-controls').append(section);bind[kind]={chips,select,value,list};
- }
- for(const mode of lightingOptions){const b=btn('',mode.label,()=>api.change({light:mode.id,kelvin:mode.kelvin}));b.dataset.id=mode.id;$('light-options').append(b);}
- for(const [id,name,min,max,step,unit] of ranges){
-  const e=el('label','range'),title=el('span','rlabel',name),out=el('output');out.id=id+'-value';title.append(out);const input=el('input');input.type='range';input.id=id;input.min=min;input.max=max;input.step=step;input.name=id;input.setAttribute('aria-label',name);input.addEventListener('input',()=>api.change({[id]:Number(input.value)}));out.htmlFor=id; e.append(title,input);$('ranges').append(e);
- }
- $('reset-lights').onclick=()=>{const m=lightingOptions.find(x=>x.id===api.current().light);api.change({kelvin:m.kelvin,intensity:defaults.intensity,shelf:defaults.shelf,daylight:defaults.daylight});};
- const refs=JSON.parse($('referenceData').textContent);
- for(const [label,k,settings] of presets){const b=btn('look','',()=>{api.change({...defaults,...settings});toast(label+' applied');});const img=el('img');img.alt='';img.src='data:image/jpeg;base64,'+refs[k];b.append(img,el('span','',label));$('presets').append(b);}
- for(const [id,label,ic] of cameraViews){const b=btn('',label,()=>api.camera(id));b.id='camera-'+id;b.prepend(icon(ic));$('view-nav').append(b);}
- const detail=el('select','camera-details');detail.id='camera-details';detail.setAttribute('aria-label','Detail views');
- option(detail,'','Details');for(const [id,label] of [['display','Saree display'],['till','Cash counter'],['arch','Arch & transom']])option(detail,id,label);
- detail.addEventListener('change',()=>api.camera(detail.value||'cutaway'));$('view-nav').append(detail);
- function tab(key){for(const k of ['finishes','lighting','looks']){const active=key===k;$('tab-'+k).setAttribute('aria-selected',String(active));$('panel-'+k).hidden=!active;}}
- for(const k of ['finishes','lighting','looks'])$('tab-'+k).onclick=()=>tab(k);
- $('jump-save').onclick=()=>{tab('looks');$('design-name').focus();};
- let saved=[];try{const a=JSON.parse(localStorage.getItem(key)||'[]');if(Array.isArray(a))saved=a.filter(v=>v&&typeof v.name==='string'&&v.state).map(v=>({name:v.name.slice(0,52),state:validState(v.state)}));}catch{}
- function persist(){try{localStorage.setItem(key,JSON.stringify(saved));return true;}catch{return false;}}
- function listSaved(){$('saved').replaceChildren();saved.forEach((v,i)=>{const row=el('div','saved');const use=btn('use',v.name,()=>{api.change(v.state);toast('Applied '+v.name);});const remove=btn('delete','Remove',()=>{const prev=saved.slice();saved.splice(i,1);if(!persist()){saved=prev;toast('Browser storage is unavailable');}listSaved();});remove.setAttribute('aria-label','Remove '+v.name);row.append(use,remove);$('saved').append(row);});}
- $('save-form').onsubmit=e=>{e.preventDefault();const name=$('design-name').value.trim();if(!name)return;const prev=saved.slice();const idx=saved.findIndex(v=>v.name.toLowerCase()===name.toLowerCase());if(idx!==-1){toast('That name is already saved. Choose a new name.');return;}saved.push({name,state:{...api.current()}});if(!persist()){saved=prev;toast('This browser could not save the design');return;}$('design-name').value='';listSaved();toast('Design saved');};listSaved();
- $('export').onclick=api.exportPNG;$('live').onclick=()=>api.quality('live');$('trace').onclick=()=>api.quality('trace');
- $('zoom-in').onclick=()=>api.zoom(1.18);$('zoom-out').onclick=()=>api.zoom(1/1.18);$('reset').onclick=api.reset;
- return {
-  sync(s){
-   for(const kind of ['floor','wood','wall']){
-    const b=bind[kind],v=b.list.find(x=>x.id===s[kind]);b.value.textContent=v?.label||'Custom colours';b.select.value=s[kind];
-    for(const chip of b.chips.children)chip.setAttribute('aria-pressed',String(chip.dataset.id===s[kind]));
-    if(kind==='wall'){$('customWall').value=v?.accent||s.customWall;$('customCompanion').value=v?.companion||s.customCompanion;}
-   }
-   for(const b of $('light-options').children)b.setAttribute('aria-pressed',String(b.dataset.id===s.light));
-   for(const [id,,min,max,,unit] of ranges){$(id).value=s[id];$(id).style.setProperty('--pct',(s[id]-min)/(max-min)*100+'%');$(id+'-value').textContent=s[id].toLocaleString('en-IN')+unit;}
-  },
-  selectView(k){detail.value=['display','till','arch'].includes(k)?k:'';detail.classList.toggle('selected',!!detail.value);for(const [id] of cameraViews)$('camera-'+id).setAttribute('aria-pressed',String(id===k));},
-  quality(k){$('trace').setAttribute('aria-pressed',String(k==='trace'));$('live').setAttribute('aria-pressed',String(k==='live'));$('sample').hidden=k!=='trace';}
- };
+  ids.forEach((id,i)=>{
+    const tab=$('tab-'+id);tab.onclick=()=>active(id);
+    tab.onkeydown=e=>{
+      const direction={ArrowRight:1,ArrowLeft:-1}[e.key];
+      if(!direction&&e.key!=='Home'&&e.key!=='End')return;
+      e.preventDefault();const next=e.key==='Home'?ids[0]:e.key==='End'?ids.at(-1):ids[(i+ids.length+direction)%ids.length];
+      active(next);$('tab-'+next).focus();
+    };
+  });
+  active('finishes');return active;
+}
+export function initUI(api){
+  document.querySelectorAll('[data-icon]').forEach(node=>node.replaceWith(icon(node.dataset.icon)));
+  const {change,endGesture}=historyControls(api),tab=bindTabs(),bound={};
+  for(const [kind,label,panel,list,open] of groups){
+    const section=el('details','material-group');section.open=open;section.dataset.group=kind;
+    const summary=el('summary'),value=el('span','value');summary.append(el('span','category-name',label),value);section.append(summary);
+    const chips=el('div','swatches'),nodes=new Map();chips.dataset.kind=kind;chips.setAttribute('role','group');chips.setAttribute('aria-label',label);
+    const select=el('select','selectbox');select.id=kind;select.setAttribute('aria-label',label);
+    for(const item of list){
+      const chip=btn('chip','',()=>change({[kind]:item.id}));chip.dataset.id=item.id;chip.title=item.label;chip.setAttribute('aria-label',item.label);
+      chip.setAttribute('aria-pressed','false');
+      if(item.preview)chip.style.backgroundImage='url("'+item.preview+'")';else chip.style.background=item.swatch;
+      chips.append(chip);nodes.set(item.id,chip);option(select,item.id,item.label);
+    }
+    if(kind==='wall')option(select,'custom','Custom colours');
+    select.onchange=()=>change({[kind]:select.value});section.append(chips,select);
+    if(kind==='wall'){
+      const row=el('div','custom-paints');
+      for(const [prop,name] of [['customWall','Accent'],['customCompanion','Companion']]){
+        const l=el('label','',name),c=el('input');c.type='color';c.id=prop;c.title=name+' paint colour';
+        c.oninput=()=>change({wall:'custom',customWall:$('customWall').value,customCompanion:$('customCompanion').value},prop);
+        c.onchange=endGesture;c.onblur=endGesture;l.prepend(c);row.append(l);
+      }section.append(row);
+    }
+    $(panel==='display'?'display-controls':'finish-controls').append(section);
+    bound[kind]={nodes,select,section,value,items:new Map(list.map(x=>[x.id,x])),open,label};
+  }
+  let savedOpen=null;
+  $('find-finish').oninput=e=>{
+    const query=e.target.value.trim().toLowerCase(),rows=groups.filter(x=>x[2]==='finishes');
+    if(query&&!savedOpen)savedOpen=new Map(rows.map(([k])=>[k,bound[k].section.open]));
+    let matches=0;
+    for(const [k] of rows){
+      const b=bound[k],groupMatch=b.label.toLowerCase().includes(query);let any=false;
+      for(const [id,chip] of b.nodes){const match=groupMatch||b.items.get(id).label.toLowerCase().includes(query);chip.hidden=!match;any||=match;}
+      b.section.hidden=!any;
+      if(query&&any)b.section.open=true;else if(!query&&savedOpen)b.section.open=savedOpen.get(k);
+      if(any)matches++;
+    }
+    $('no-finish').hidden=!!matches;if(!query)savedOpen=null;
+  };
+  const lampButtons=new Map(),rangeControls=new Map();
+  for(const mode of lightingOptions){
+    const b=btn('',mode.label,()=>change({light:mode.id,kelvin:mode.kelvin}));b.dataset.id=mode.id;b.setAttribute('aria-pressed','false');
+    $('light-options').append(b);lampButtons.set(mode.id,b);
+  }
+  for(const [id,name,min,max,step,unit] of ranges){
+    if(id==='shelf')$('ranges').append(el('h3','range-heading','Individual circuits'));
+    if(id==='beamSpread')$('ranges').append(el('h3','range-heading','Beam adjustment'));
+    const wrap=el('label','range'),head=el('span','rlabel',name),out=el('output');out.id=id+'-value';head.append(out);
+    const input=el('input');Object.assign(input,{type:'range',id,min,max,step,name:id});input.setAttribute('aria-label',name);
+    input.oninput=()=>change({[id]:Number(input.value)},id);
+    input.onchange=endGesture;input.onblur=endGesture;input.onpointerdown=endGesture;
+    out.htmlFor=id;wrap.append(head,input);$('ranges').append(wrap);rangeControls.set(id,{input,out,min,max,unit});
+  }
+  $('reset-lights').onclick=()=>{
+    const reset=Object.fromEntries(ranges.map(([id])=>[id,defaults[id]]));reset.kelvin=catalog.light.find(x=>x.id===api.current().light).kelvin;change(reset);
+  };
+  $('jump-save').onclick=()=>{tab('looks');$('design-name').focus();};
+  initDesigns(api,change,toast);
+  for(const [id,label,ic] of cameraViews){const b=btn('',label,()=>api.camera(id));b.id='camera-'+id;b.prepend(icon(ic));$('view-nav').append(b);}
+  const detail=el('select','camera-details');detail.id='camera-details';detail.setAttribute('aria-label','Detail views');
+  option(detail,'','Details');for(const [id,label] of detailsViews)option(detail,id,label);
+  detail.onchange=()=>api.camera(detail.value||'cutaway');$('view-nav').append(detail);
+  $('export').onclick=api.exportPNG;$('live').onclick=()=>api.quality('live');$('trace').onclick=()=>api.quality('trace');
+  const preference='boutique-studio-live-quality';
+  try{
+    const saved=localStorage.getItem(preference);
+    if(['auto','fast','fine'].includes(saved)){$('performance').value=saved;api.performance(saved);}
+  }catch{}
+  $('performance').onchange=e=>{
+    const mode=e.target.value;api.performance(mode);
+    try{localStorage.setItem(preference,mode);}catch{}
+  };
+  $('zoom-in').onclick=()=>api.zoom(1.18);$('zoom-out').onclick=()=>api.zoom(1/1.18);$('reset').onclick=api.reset;
+  let prev={},busyTimer;
+  return {
+    sync(state){
+      for(const [k,b] of Object.entries(bound)){
+        if(prev[k]===state[k])continue;
+        b.nodes.get(prev[k])?.setAttribute('aria-pressed','false');b.nodes.get(state[k])?.setAttribute('aria-pressed','true');
+        b.value.textContent=b.items.get(state[k])?.label||'Custom colours';b.select.value=state[k];
+      }
+      if(prev.wall!==state.wall||prev.customWall!==state.customWall||prev.customCompanion!==state.customCompanion){
+        const pair=bound.wall.items.get(state.wall);$('customWall').value=pair?.accent||state.customWall;$('customCompanion').value=pair?.companion||state.customCompanion;
+      }
+      if(prev.light!==state.light){lampButtons.get(prev.light)?.setAttribute('aria-pressed','false');lampButtons.get(state.light)?.setAttribute('aria-pressed','true');}
+      for(const [k,r] of rangeControls){
+        if(prev[k]===state[k])continue;
+        r.input.value=state[k];r.input.style.setProperty('--pct',(state[k]-r.min)/(r.max-r.min)*100+'%');
+        r.out.textContent=state[k].toLocaleString('en-IN')+r.unit;
+      }
+      prev=state;
+    },
+    selectView(k){detail.value=detailsViews.some(x=>x[0]===k)?k:'';detail.classList.toggle('selected',!!detail.value);for(const [id] of cameraViews)$('camera-'+id).setAttribute('aria-pressed',String(id===k));},
+    quality(k){$('trace').setAttribute('aria-pressed',String(k==='trace'));$('live').setAttribute('aria-pressed',String(k==='live'));$('sample').hidden=k!=='trace';$('performance').disabled=k==='trace';},
+    busy(on){clearTimeout(busyTimer);if(!on){$('fixture-status').hidden=true;return;}busyTimer=setTimeout(()=>$('fixture-status').hidden=false,180);}
+  };
 }

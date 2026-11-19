@@ -4,7 +4,10 @@ import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.j
 
 const PI = Math.PI, TAU = PI * 2;
 const V = (x,y,z) => new THREE.Vector3(x,y,z);
-const palette = ['#a62d4d','#15786e','#c98225','#603982','#275784','#ac443b','#8a7138'];
+import {collections,dyes,fabrics,seats} from './merchandise.js';
+const palette = collections[0].colours;
+const layers=new Map(), clothMaterials=[];
+let seatingMaterials;
 let cachedDetail;
 
 function finish(name,color,options={}) {
@@ -13,11 +16,13 @@ function finish(name,color,options={}) {
   return m;
 }
 
-function clothPattern(color, role) {
+function weaveLayer(role,motif) {
+  const key=role+'|'+motif;
+  if(layers.has(key))return layers.get(key);
   const cv = document.createElement('canvas');
-  cv.width=512;cv.height=768;
+  cv.width=256;cv.height=384;
   const c=cv.getContext('2d');
-  c.fillStyle=color;c.fillRect(0,0,512,768);
+  c.scale(.5,.5);
   const glow=c.createLinearGradient(0,0,512,32);
   glow.addColorStop(0,'rgba(21,11,18,.08)');glow.addColorStop(.44,'rgba(253,215,160,.06)');glow.addColorStop(.79,'rgba(21,11,18,.06)');glow.addColorStop(1,'rgba(253,215,160,.035)');
   c.fillStyle=glow;c.fillRect(0,0,512,768);
@@ -26,37 +31,88 @@ function clothPattern(color, role) {
   function buti(x,y,s) {
     c.save();c.translate(x,y);c.scale(s,s);c.lineWidth=1.15;c.strokeStyle='#d8ad67';c.fillStyle='#cf9e55';
     c.beginPath();c.moveTo(-4.8,4);c.bezierCurveTo(-10,-2,-1,-4,0,-8);c.bezierCurveTo(1,-10,1,-12,0,-13);c.bezierCurveTo(7,-7,9,1,3,5);c.bezierCurveTo(0,7,-3,6,-4.8,4);c.fill();
-    c.strokeStyle=color;c.beginPath();c.moveTo(-3,3);c.quadraticCurveTo(1,2,2,-5);c.stroke();
+    c.globalCompositeOperation='destination-out';c.beginPath();c.moveTo(-3,3);c.quadraticCurveTo(1,2,2,-5);c.stroke();c.globalCompositeOperation='source-over';
     c.fillStyle='#ead197';c.beginPath();c.arc(0,8,1.12,0,TAU);c.fill();c.restore();
   }
   // Alternating small zari butis remain legible on both draped and folded cloth.
   const step=role==='fold'?64:48, row=role==='fold'?67:49;
-  for(let j=0;j<768/row+1;j++)for(let i=-1;i<512/step+1;i++)buti(i*step+(j%2)*step*.5,j*row+12,role==='fold'?.82:.72);
+  if(motif==='buti'||motif==='floral'||motif==='dot'){
+    for(let j=0;j<768/row+1;j++)for(let i=-1;i<512/step+1;i++){
+      const x=i*step+(j%2)*step*.5,y=j*row+12;
+      if(motif==='buti')buti(x,y,role==='fold'?.82:.72);
+      else if(motif==='dot'){c.fillStyle='#d5b778';c.beginPath();c.arc(x,y,2.1,0,TAU);c.fill();}
+      else {c.save();c.translate(x,y);c.fillStyle='#d1ae73';for(let k=0;k<4;k++){c.rotate(PI*.5);c.beginPath();c.ellipse(0,3.7,2,4.7,.13,0,TAU);c.fill();}c.restore();}
+    }
+  }else if(motif!=='plain'){
+    c.strokeStyle='rgba(229,201,144,.63)';c.lineWidth=1.8;c.beginPath();
+    if(motif==='diamond'){
+      for(let x=-768;x<1300;x+=48){c.moveTo(x,0);c.lineTo(x+768,768);c.moveTo(x,0);c.lineTo(x-768,768);}
+    }else{
+      for(let x=0;x<512;x+=32){c.moveTo(x,0);c.lineTo(x,768);if(motif==='stripe'){c.moveTo(x+4,0);c.lineTo(x+4,768);}}
+      if(motif==='check')for(let y=0;y<768;y+=32){c.moveTo(0,y);c.lineTo(512,y);}
+    }
+    c.stroke();
+  }
   function brocade(y,height) {
     const gold=c.createLinearGradient(0,y,0,y+height);
     gold.addColorStop(0,'#b4894d');gold.addColorStop(.10,'#e4c483');gold.addColorStop(.22,'#b68d50');gold.addColorStop(.53,'#d4b16e');gold.addColorStop(.82,'#bd9459');gold.addColorStop(.94,'#e9cf91');gold.addColorStop(1,'#a87c40');
     c.fillStyle=gold;c.fillRect(0,y,512,height);
-    c.lineWidth=1.2;c.strokeStyle=color;
+    c.globalCompositeOperation='destination-out';c.lineWidth=1.2;c.strokeStyle='#000';
     for(const f of [.08,.13,.84,.90]){c.beginPath();c.moveTo(0,y+height*f);c.lineTo(512,y+height*f);c.stroke();}
     for(let x=-16;x<528;x+=22){
       const cy=y+height*.50,r=height*.22;
       c.beginPath();c.moveTo(x-11,cy);c.quadraticCurveTo(x,cy-r*2,x+11,cy);c.quadraticCurveTo(x,cy+r*2,x-11,cy);c.stroke();
-      c.fillStyle=color;c.beginPath();c.ellipse(x,cy,2.6,r*.56,.35,0,TAU);c.fill();
+      c.fillStyle='#000';c.beginPath();c.ellipse(x,cy,2.6,r*.56,.35,0,TAU);c.fill();
     }
+    c.globalCompositeOperation='source-over';
   }
   if(role==='skirt'){brocade(692,65);brocade(681,5);}
   else if(role==='fold'){brocade(634,90);brocade(620,5);brocade(730,6);}
   else if(role==='pallu'){
     brocade(692,66);
-    for(const x of [0,486]){c.save();c.translate(x+26,0);c.rotate(PI/2);const g=c.createLinearGradient(0,0,0,26);g.addColorStop(0,'#e7c587');g.addColorStop(.5,'#af864b');g.addColorStop(1,'#d6b675');c.fillStyle=g;c.fillRect(0,0,768,26);c.strokeStyle=color;c.lineWidth=1.3;for(let k=0;k<780;k+=18){c.beginPath();c.moveTo(k,4);c.lineTo(k+9,13);c.lineTo(k,22);c.lineTo(k-9,13);c.closePath();c.stroke();}c.restore();}
+    for(const x of [0,486]){c.save();c.translate(x+26,0);c.rotate(PI/2);const g=c.createLinearGradient(0,0,0,26);g.addColorStop(0,'#e7c587');g.addColorStop(.5,'#af864b');g.addColorStop(1,'#d6b675');c.fillStyle=g;c.fillRect(0,0,768,26);c.globalCompositeOperation='destination-out';c.strokeStyle='#000';c.lineWidth=1.3;for(let k=0;k<780;k+=18){c.beginPath();c.moveTo(k,4);c.lineTo(k+9,13);c.lineTo(k,22);c.lineTo(k-9,13);c.closePath();c.stroke();}c.restore();}
   }
-  const map=new THREE.CanvasTexture(cv);map.colorSpace=THREE.SRGBColorSpace;map.wrapS=map.wrapT=THREE.RepeatWrapping;map.anisotropy=4;
-  return map;
+  layers.set(key,cv);return cv;
 }
 
-function silk(color,role) {
-  const m=new THREE.MeshPhysicalMaterial({name:'Woven silk '+color+' '+role,map:clothPattern(color,role),roughness:.48,metalness:.035,sheen:.63,sheenRoughness:.48,sheenColor:new THREE.Color(color).lerp(new THREE.Color('#dfc297'),.35),side:THREE.DoubleSide});
-  m.userData.surface='silk';return m;
+function dyeMap(mat,colour,motif) {
+  const role=mat.userData.role,layer=weaveLayer(role,motif);
+  const c=mat.map.image.getContext('2d');
+  c.fillStyle=colour;c.fillRect(0,0,layer.width,layer.height);c.drawImage(layer,0,0);
+  mat.map.needsUpdate=true;
+  mat.sheenColor.set(colour).lerp(threadTone,.35);
+}
+const threadTone=new THREE.Color('#dfc297');
+function silk(colour,role,slot) {
+  const canvas=document.createElement('canvas');canvas.width=256;canvas.height=384;
+  const map=new THREE.CanvasTexture(canvas);
+  map.colorSpace=THREE.SRGBColorSpace;map.wrapS=map.wrapT=THREE.RepeatWrapping;map.anisotropy=4;
+  const m=new THREE.MeshPhysicalMaterial({name:'Woven silk '+colour+' '+role,map,roughness:.48,metalness:.035,sheen:.63,sheenRoughness:.48,side:THREE.DoubleSide});
+  m.userData={surface:'silk',role,slot,currentDye:colour,currentMotif:'buti',cloth:'silk'};
+  dyeMap(m,colour,'buti');clothMaterials.push(m);return m;
+}
+
+export function applyDisplay(state) {
+  if(!clothMaterials.length)return;
+  const colours=(collections.find(x=>x.id===state.collection)||collections[0]).colours;
+  const left=(dyes.find(x=>x.id===state.outfitLeft)||dyes[0]).swatch;
+  const right=(dyes.find(x=>x.id===state.outfitRight)||dyes[1]).swatch;
+  const fabric=fabrics.find(x=>x.id===state.cloth)||fabrics[0],motif=state.motif||'buti';
+  for(const mat of clothMaterials){
+    const data=mat.userData,colour=data.slot==='left'?left:data.slot==='right'?right:colours[data.slot];
+    if(data.currentDye!==colour||data.currentMotif!==motif){
+      dyeMap(mat,colour,motif);data.currentDye=colour;data.currentMotif=motif;
+    }
+    if(data.cloth!==fabric.id){
+      mat.roughness=fabric.rough;mat.metalness=fabric.metal;mat.sheen=fabric.sheen;mat.sheenRoughness=fabric.sheenRough;data.cloth=fabric.id;
+    }
+  }
+  const seat=seats.find(x=>x.id===state.seat)||seats[0];
+  if(seatingMaterials&&seat.id!==seatingMaterials.current){
+    seatingMaterials.base.color.set(seat.swatch);
+    seatingMaterials.edge.color.copy(seatingMaterials.base.color).multiplyScalar(.61);
+    seatingMaterials.current=seat.id;
+  }
 }
 
 function surface(nx,ny,point,flip=false) {
@@ -76,7 +132,11 @@ function batch(name) {
   const lists=new Map();
   return {
     add(g,mat) {
-      if(g.index)g=g.toNonIndexed();
+      if(!g.index){
+        const count=g.attributes.position.count,Index=count>65535?Uint32Array:Uint16Array,index=new Index(count);
+        for(let i=0;i<count;i++)index[i]=i;
+        g.setIndex(new THREE.BufferAttribute(index,1));
+      }
       // Retain a common vertex layout for batching.
       for(const key of Object.keys(g.attributes))if(!['position','normal','uv'].includes(key))g.deleteAttribute(key);
       if(!lists.has(mat))lists.set(mat,[]);lists.get(mat).push(g);
@@ -94,7 +154,7 @@ function batch(name) {
 }
 
 function oval(b,mat,ctr,r,angle=0) {
-  const g=new THREE.SphereGeometry(1,22,18);g.scale(r[0],r[1],r[2]);g.rotateZ(angle);g.translate(...ctr);b.add(g,mat);
+  const g=new THREE.SphereGeometry(1,16,12);g.scale(r[0],r[1],r[2]);g.rotateZ(angle);g.translate(...ctr);b.add(g,mat);
 }
 function rod(b,mat,start,end,r0,r1=r0,segments=10) {
   const a=V(...start),z=V(...end),diff=z.clone().sub(a);
@@ -136,7 +196,7 @@ function dressForm(b,c,side,materials) {
   }});
   const body=[[.907,.105,.085,.003],[.980,.101,.082,.003],[1.045,.110,.089,.005],[1.100,.125,.098,.006],[1.161,.146,.109,.010],[1.204,.150,.102,.009],[1.245,.147,.090,.004],[1.273,.157,.078,-.004],[1.290,.155,.069,-.004],[1.314,.114,.065,-.002],[1.330,.070,.057,0],[1.342,.050,.048,0]];
   const chest=(x,y)=>{const [rx,rz,z0]=sample(body,y);return z0+rz*Math.sqrt(Math.max(.008,1-(x/rx)**2))+.011*Math.exp(-Math.pow((Math.abs(x)-.065)/.040,2)-Math.pow((y-1.18)/.055,2));};
-  profile(b,skin,body,{levels:56,deform(t,v,x,z,y){return V(x,y,Math.cos(t)>0?chest(x,y):z);}});
+  profile(b,skin,body,{levels:40,segments:46,deform(t,v,x,z,y){return V(x,y,Math.cos(t)>0?chest(x,y):z);}});
   b.add(surface(70,44,(u,v)=>{
     const t=u*TAU-PI,front=Math.max(0,Math.cos(t)),back=Math.max(0,-Math.cos(t));
     const top=1.315-.104*Math.pow(front,3.4)-.067*Math.pow(back,3),y=.997+(top-.997)*v;
@@ -163,7 +223,7 @@ function dressForm(b,c,side,materials) {
   const neck=[[1.296,.060,.050,-.004],[1.32,.062,.053,-.003],[1.343,.047,.041,-.001],[1.374,.041,.038,.003],[1.40,.045,.042,.009],[1.422,.057,.050,.009]];
   profile(b,skin,neck,{segments:48,levels:28});
   const skull=[[1.39,.008,.018,.037],[1.398,.031,.037,.033],[1.409,.044,.050,.028],[1.424,.056,.061,.020],[1.45,.066,.072,.011],[1.477,.074,.079,.006],[1.506,.078,.085,.002],[1.54,.080,.086,-.001],[1.570,.075,.082,-.006],[1.601,.063,.068,-.009],[1.621,.042,.048,-.011],[1.634,.013,.016,-.010],[1.636,.001,.002,-.01]];
-  profile(b,skin,skull,{segments:62,levels:62});
+  profile(b,skin,skull,{segments:44,levels:40});
   for(const s of [-1,1]){
     oval(b,skin,[s*.066,.040,.063],[.048,.026,.092],-.06*s);
     for(let i=0;i<5;i++)oval(b,skin,[s*(.045+i*.010),.027,.125-i*.005],[.0095-i*.0008,.0095,.021-i*.001],0);
@@ -230,11 +290,11 @@ function shopDetails() {
   const skin=finish('mannequin',0xe9dcc7,{roughness:.41});
   const gold=finish('brushed brass',0xc2a062,{metalness:.76,roughness:.32});
   ['#14776b','#a22b46'].forEach((color,i)=>{
-    const skirt=silk(color,'skirt'),pallu=silk(color,'pallu'),blouse=silk(color,'blouse');
+    const skirt=silk(color,'skirt',i===0?'right':'left'),pallu=silk(color,'pallu',i===0?'right':'left'),blouse=silk(color,'blouse',i===0?'right':'left');
     forms.add(dressForm(batch('Saree form '+(i+1)),i===0?{x:2.165,z:-.24}:{x:1.757,z:-.23},i===0?1:-1,{skin,gold,skirt,pallu,blouse}));
   });
   const b=batch('Folded and hanging silk');
-  const textiles=palette.map(c=>silk(c,'fold')),hanging=palette.map(c=>silk(c,'skirt'));
+  const textiles=palette.map((c,i)=>silk(c,'fold',i)),hanging=palette.map((c,i)=>silk(c,'skirt',i));
   const hanger=finish('timber',0x503827,{roughness:.43});
   const xbase=.168, shelfStart=-3.4692;
   function pile(x,y,z,w,d,count,seed) {
@@ -263,6 +323,7 @@ function shopDetails() {
     folded(b,textiles[tint],1.615,.860+j*.014,-2.93+n*.36,.209,.256,.0135,.012*Math.sin(j*1.1+n),j);
   }
   const stool=batch('Upholstered counter stools'),upholstery=finish('upholstery',0xc99b6c,{roughness:.83}),piping=finish('saddle piping',0x9c6f4c,{roughness:.69});
+  seatingMaterials={base:upholstery,edge:piping,current:'saddle'};
   for(const z of [-3.09,-2.56,-2.03]) {
     const centre=1.14;
     for(const s of [-1,1])for(const t of [-1,1])rod(stool,hanger,[centre+s*.089,.011,z+t*.091],[centre+s*.061,.384,z+t*.067],.014,.017);

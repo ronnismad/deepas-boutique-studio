@@ -1,24 +1,27 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { Reflector } from 'three/addons/objects/Reflector.js';
-import { enhanceModel } from './realism.js';
+import { installMirrors } from './mirrors.js';
+import { enhanceModel, applyDisplay } from './realism.js';
 import { createFinishes, finishOptions } from './finishes.js';
 import { prepareLighting, updateEnvironment, lightingOptions } from './lighting.js';
 import { makeEnclosure } from './enclosure.js';
 import { createTrace } from './trace.js';
-import { liveRendering, streetView, finishTransom } from './surfaces.js';
+import { liveRendering, streetView, finishTransom, studioContact } from './surfaces.js';
 import { $, initUI, defaults, validState, toast } from './ui.js';
 
 const stage = $('stage'), canvas = $('view'), status = $('status');
-const assets = new Map();
+const rigs = new Map();
+let roomPromise, activeRig;
 const overhead = new THREE.OrthographicCamera(-5,5,5,-5,.04,90);
 const eye = new THREE.PerspectiveCamera(57,1,.035,90);
 const scene = new THREE.Scene();
-let renderer, controls, hemisphere, sun, packed, ui, tracer, live, street;
+let renderer, controls, hemisphere, sun, packed, ui, tracer, live, street, contactShadow;
 let entranceOpen=false;
 let state = {...defaults}, displayed, camera = overhead, view = 'cutaway', quality = 'live';
-let revision = 0, framePending = false, mirrorDepth = 0, cameraLocked = false, everFramed = false;
+let revision=0, framePending=false, cameraLocked=false, everFramed=false;
+let redrawTimer=0, editFrame=0, previewRequested=false, performanceMode='auto', lastWidth=0, lastHeight=0, lastRatio=0;
+overhead.layers.enable(1);eye.layers.enable(1);
 
 function loadPackedModel(name) {
   const model = packed.models[name], bytes = new Uint8Array(model.length);
@@ -54,28 +57,26 @@ function daylightEnvironment() {
   tex.mapping=THREE.EquirectangularReflectionMapping;tex.colorSpace=THREE.LinearSRGBColorSpace;
   tex.needsUpdate=true;return tex;
 }
-function requestDraw() {
-  if(framePending||!renderer)return;
-  framePending=true;
-  requestAnimationFrame(()=>{framePending=false;if(quality==='live')live.draw();});
-}
-function setupMirrors(object) {
-  for(const group of [...object.children]) {
-    if(!group.name.toLowerCase().startsWith('mirror'))continue;
-    let silver;
-    group.traverse(m=>{if(m.isMesh&&(m.material.name.toLowerCase().includes('silver')||m.material.metalness>.96))silver=m;});
-    if(!silver)continue;
-    const bounds=new THREE.Box3().setFromObject(silver),size=bounds.getSize(new THREE.Vector3()),centre=bounds.getCenter(new THREE.Vector3());
-    const alongZ=size.z>size.x;
-    const mirror=new Reflector(new THREE.PlaneGeometry(alongZ?size.z:size.x,size.y),{color:0xe1e5df,textureWidth:768,textureHeight:768,clipBias:.001});
-    mirror.name='Reflection • '+group.name;mirror.userData.planarMirror=true;
-    mirror.rotation.y=alongZ?-Math.PI/2:Math.PI;mirror.position.copy(centre);
-    if(alongZ)mirror.position.x-=.0025;else mirror.position.z-=.0025;
-    const reflect=mirror.onBeforeRender;
-    mirror.onBeforeRender=function(...args){if(mirrorDepth||scene.overrideMaterial)return;mirrorDepth++;try{reflect.apply(this,args);}finally{mirrorDepth--;}};
-    silver.visible=false;object.add(mirror);
+function requestDraw(interacting=false) {
+  if(!renderer||quality!=='live')return;
+  clearTimeout(redrawTimer);
+  previewRequested=performanceMode==='fast'||(performanceMode==='auto'&&interacting);
+  if(!framePending){
+    framePending=true;
+    requestAnimationFrame(()=>{framePending=false;if(quality==='live')live.draw(!previewRequested);});
+  }
+  if(interacting&&performanceMode==='auto'){
+    redrawTimer=setTimeout(()=>requestDraw(false),220);
   }
 }
+function performanceSetting(mode){
+  if(!['auto','fast','fine'].includes(mode)||mode===performanceMode)return;
+  performanceMode=mode;canvas.dataset.performance=mode;
+  displayed?.mirrors.size(mirrorSize());
+  resize();requestDraw();
+}
+function mirrorSize(){return performanceMode==='fine'?768:performanceMode==='fast'?256:512;}
+function refreshReflections(){displayed?.mirrors.invalidate();}
 function tuneGlass(asset){
   const replacements=new Map();
   asset.scene.traverse(o=>{
@@ -88,6 +89,7 @@ function tuneGlass(asset){
     const original=o.material;
     if(!replacements.has(original)){
       const m=new THREE.MeshPhysicalMaterial({name:original.name,color:0xc6e3de,transparent:true,opacity:Math.min(original.opacity,.065),side:original.side,depthWrite:false,roughness:.085,metalness:.18,clearcoat:1,clearcoatRoughness:.035,envMapIntensity:1.2});
+      m.forceSinglePass=true;
       if(original.opacity>.40){m.opacity=original.opacity;m.roughness=.24;}
       else {
         m.onBeforeCompile=shader=>{
@@ -102,20 +104,85 @@ function tuneGlass(asset){
     o.castShadow=false;o.receiveShadow=false;
   });
 }
-async function prepare(base,initialMode){
-  const asset=await new GLTFLoader().parseAsync(loadPackedModel(base),'');
+function fixtureNode(def){
+  return !!def.extensions?.KHR_lights_punctual || /retained soffit/i.test(def.name||'');
+}
+function buildRig(asset,base){
+  const group=new THREE.Group();group.name=base+' lighting';
+  const {parser}=asset;
+  for(const child of [...asset.scene.children]){
+    const index=parser.associations.get(child)?.nodes;
+    if(index!==undefined&&fixtureNode(parser.json.nodes[index]))group.add(child);
+  }
+  group.traverse(node=>{if(node.isMesh){node.castShadow=!node.material.transparent;node.receiveShadow=!node.material.transparent;}});
+  return {group,apply:prepareLighting({scene:group},base)};
+}
+function loadRig(base){
+  if(!rigs.has(base)){
+    // Other base files describe the same shop. Ask the glTF loader for just
+    // their fixture meshes and lights, keeping the measured shell loaded once.
+    const loader=new GLTFLoader();
+    loader.register(parser=>({name:'StudioFixtureSubset',beforeRoot(){
+      const doc=parser.json;
+      for(const scene of doc.scenes)scene.nodes=scene.nodes.filter(i=>fixtureNode(doc.nodes[i]));
+    }}));
+    const promise=loader.parseAsync(loadPackedModel(base),'').then(asset=>buildRig(asset,base)).catch(e=>{rigs.delete(base);throw e;});
+    rigs.set(base,promise);
+  }
+  return rigs.get(base);
+}
+function surveyFraming(object){
+  const vertices=[],v=new THREE.Vector3();
+  for(const group of object.children){
+    if(!/room.shell|frontage.steps|existing.pillar|rear.arched|stair.and.sliding|right.partition/i.test(group.name))continue;
+    group.traverseVisible(node=>{
+      const pos=node.geometry?.attributes.position;if(!pos)return;
+      for(let j=0;j<pos.count;j++)vertices.push(v.fromBufferAttribute(pos,j).applyMatrix4(node.matrixWorld).clone());
+    });
+  }
+  return {vertices,centre:new THREE.Box3().setFromPoints(vertices).getCenter(new THREE.Vector3()),views:new Map()};
+}
+function hideBuriedSlabEdge(asset){
+  // The cut edge of the +1.350 m mezzanine and the face of the painted
+  // partition share a plane. The finish covers this internal concrete face.
+  const shell=asset.scene.children.find(o=>/room.shell.and.flooring/i.test(o.name));
+  shell?.traverse(node=>{
+    if(!node.isMesh || node.material.name.toLowerCase()!=='#b4aba0')return;
+    const g=node.geometry,pos=g.attributes.position,norm=g.attributes.normal,ix=g.index;
+    const visible=[],count=ix?ix.count:pos.count;
+    for(let i=0;i<count;i+=3){
+      const a=ix?ix.getX(i):i,b=ix?ix.getX(i+1):i+1,c=ix?ix.getX(i+2):i+2;
+      if(norm.getX(a)<-.99 && Math.abs(pos.getX(a)-2.45)<.0001 &&
+         Math.min(pos.getY(a),pos.getY(b),pos.getY(c))>1.17)continue;
+      visible.push(a,b,c);
+    }
+    if(visible.length!==count)g.setIndex(visible);
+  });
+}
+async function prepareRoom(){
+  const asset=await new GLTFLoader().parseAsync(loadPackedModel('cove'),'');
   asset.scene.updateMatrixWorld(true);
+  const initialRig=buildRig(asset,'cove');rigs.set('cove',Promise.resolve(initialRig));
+  hideBuriedSlabEdge(asset);
+  const framing=surveyFraming(asset.scene);
   enhanceModel(asset);
   asset.scene.traverse(o=>{if(o.isMesh){o.castShadow=!o.material.transparent;o.receiveShadow=!o.material.transparent;}});
-  const finishes=await createFinishes(asset), lights=prepareLighting(asset,initialMode);
-  tuneGlass(asset);setupMirrors(asset.scene);
+  const finishes=await createFinishes(asset);
+  tuneGlass(asset);
+  const mirrors=installMirrors(asset.scene);mirrors.size(mirrorSize());
   const enclosure=makeEnclosure(asset);
   if(!enclosure.group.parent)asset.scene.add(enclosure.group);
   enclosure.group.visible=false;
-  const leaf=asset.scene.children.find(o=>o.name.toLowerCase().includes('closed_left_glass_leaf')||o.name.toLowerCase().includes('closed left glass leaf'));
-  return {asset,finishes,lights,enclosure,leaf,closedX:leaf?.position.x??0,lastFinishes:''};
+  const leaf=asset.scene.children.find(o=>/closed.left.glass.leaf/i.test(o.name));
+  return {asset,finishes,mirrors,enclosure,framing,leaf,closedX:leaf?.position.x??0,lastFinishes:''};
+}
+function preloadRigs(){
+  const warm=()=>Promise.allSettled(['track','recessed'].map(loadRig));
+  if(window.requestIdleCallback)window.requestIdleCallback(warm,{timeout:1400});else setTimeout(warm,350);
 }
 const eyeViews={
+  mezzanine:{position:[1.41,1.91,-3.91],target:[3.43,2.09,-3.81],fov:69},
+  showcase:{position:[1.96,1.28,1.37],target:[1.96,1.07,-.20],fov:62},
   front:{position:[1.09,1.56,2.38],target:[1.20,1.32,-2.7],fov:57},
   aisle:{position:[.64,1.57,-3.36],target:[1.53,1.15,-.85],fov:66},
   display:{position:[2.27,1.50,-2.15],target:[.19,1.02,-2.24],fov:59},
@@ -131,71 +198,78 @@ function moveDoor(model) {
 }
 function toggleDoor(){
   if(!displayed?.leaf)return;
-  entranceOpen=!entranceOpen;moveDoor(displayed);tracer?.invalidate(true);requestDraw();
+  entranceOpen=!entranceOpen;moveDoor(displayed);refreshReflections();renderer.shadowMap.needsUpdate=true;tracer?.invalidate(true);requestDraw(true);
 }
-function applyDesign(model){
-  const key=[state.floor,state.wood,state.wall,state.customWall,state.customCompanion].join('|');
+function applyDesign(model,rig){
+  const key=[state.floor,state.wood,state.top,state.metal,state.wall,state.customWall,state.customCompanion].join('|');
   if(model.lastFinishes!==key){
     model.finishes(state);model.lastFinishes=key;
   }
   const scheme=finishOptions.walls.find(w=>w.id===state.wall);
   model.enclosure.update({accent:scheme?.accent||state.customWall,companion:scheme?.companion||state.customCompanion,daylight:state.daylight});
   street.userData.surface.color.setRGB(.15+.77*state.daylight/100,.20+.75*state.daylight/100,.26+.72*state.daylight/100);
-  moveDoor(model);model.lights(state,state.light);
+  rig.apply(state,state.light);applyDisplay(state);
+  const shadowKey=[state.light,state.beamSpread].join('|');
+  if(shadowKey!==model.lastShadow){renderer.shadowMap.needsUpdate=true;model.lastShadow=shadowKey;}
+  moveDoor(model);
   model.enclosure.group.visible=isEye();
   updateEnvironment(scene,renderer,hemisphere,sun,state,state.light);
 }
 async function selectDesign(){
   const token=++revision;
-  const mode=lightingOptions.find(m=>m.id===state.light);
-  if(!assets.has(mode.base))assets.set(mode.base,prepare(mode.base,mode.id).catch(e=>{assets.delete(mode.base);throw e;}));
-  const model=await assets.get(mode.base);
+  if(!roomPromise)roomPromise=prepareRoom().catch(e=>{roomPromise=null;throw e;});
+  const model=await roomPromise;
   if(token!==revision)return;
-  applyDesign(model);
-  if(displayed!==model){
-    if(displayed)scene.remove(displayed.asset.scene);
-    scene.add(model.asset.scene);displayed=model;
+  const mode=lightingOptions.find(m=>m.id===state.light);
+  if(activeRig?.base!==mode.base)ui.busy?.(true);
+  const rig=await loadRig(mode.base);
+  if(token!==revision)return;
+  if(displayed!==model){scene.add(model.asset.scene);displayed=model;}
+  if(activeRig!==rig){
+    if(activeRig)scene.remove(activeRig.group);
+    activeRig=rig;rig.base=mode.base;scene.add(rig.group);
+    renderer.shadowMap.needsUpdate=true;
   }
-  if(!everFramed){everFramed=true;setView(view);}
-  status.hidden=true;canvas.dataset.scheme=[state.light,state.floor,state.wall,state.wood].join('|');
+  applyDesign(model,rig);refreshReflections();
+  if(!everFramed){everFramed=true;setView(view);preloadRigs();}
+  status.hidden=true;ui.busy?.(false);
+  canvas.dataset.scheme=[state.light,state.floor,state.wall,state.wood].join('|');
   canvas.dataset.settings=JSON.stringify(state);
-  tracer?.invalidate(true);requestDraw();
+  tracer?.invalidate(true);requestDraw(true);
 }
 function change(partial) {
-  state=validState({...state,...partial});ui.sync(state);
-  selectDesign().catch(fail);
+  const next=validState({...state,...partial});
+  if(Object.keys(next).every(k=>next[k]===state[k])&&canvas.dataset.settings===JSON.stringify(state))return;
+  state=next;revision++;ui.sync(state);
+  if(editFrame)return;
+  editFrame=requestAnimationFrame(()=>{
+    editFrame=0;selectDesign().catch(fail);
+  });
 }
 function zoom(factor){
   if(!displayed)return;
   camera.zoom=THREE.MathUtils.clamp(camera.zoom*factor,.5,6);camera.updateProjectionMatrix();
-  tracer?.invalidate(false);requestDraw();
+  refreshReflections();tracer?.invalidate(false);requestDraw(true);
 }
 function fitCutaway(){
-  const object=displayed.asset.scene;
-  object.updateMatrixWorld(true);
-  const bounds=new THREE.Box3(),box=new THREE.Box3(),v=new THREE.Vector3(),points=[];
-  object.traverseVisible(o=>{
-    if(!o.isMesh||!o.geometry?.attributes.position)return;
-    const g=o.geometry;if(!g.boundingBox)g.computeBoundingBox();
-    box.copy(g.boundingBox).applyMatrix4(o.matrixWorld);bounds.union(box);
-    points.push(o);
-  });
-  const centre=bounds.getCenter(v).clone();
-  const dir=view==='plan'?new THREE.Vector3(0,1,.00005):view==='rear'?new THREE.Vector3(-.48,1.1,-.86):new THREE.Vector3(.32,1.12,.87);
-  overhead.up.set(0,1,0);overhead.position.copy(centre).addScaledVector(dir.normalize(),17);overhead.lookAt(centre);overhead.updateMatrixWorld();
-  let loX=Infinity,hiX=-Infinity,loY=Infinity,hiY=-Infinity;
-  const transform=new THREE.Matrix4();
-  for(const o of points){
-    transform.multiplyMatrices(overhead.matrixWorldInverse,o.matrixWorld);
-    const pos=o.geometry.attributes.position;
-    for(let j=0;j<pos.count;j++){
-      v.fromBufferAttribute(pos,j).applyMatrix4(transform);
+  const {vertices,centre,views}=displayed.framing;
+  let frame=views.get(view);
+  if(!frame){
+    const dir=view==='plan'?new THREE.Vector3(0,1,.00005):view==='rear'?new THREE.Vector3(-.48,1.1,-.86):new THREE.Vector3(.32,1.12,.87);
+    overhead.up.set(0,1,0);overhead.position.copy(centre).addScaledVector(dir.normalize(),17);
+    overhead.lookAt(centre);overhead.updateMatrixWorld();
+    const v=new THREE.Vector3();
+    let loX=Infinity,hiX=-Infinity,loY=Infinity,hiY=-Infinity;
+    for(const p of vertices){
+      v.copy(p).applyMatrix4(overhead.matrixWorldInverse);
       loX=Math.min(loX,v.x);hiX=Math.max(hiX,v.x);loY=Math.min(loY,v.y);hiY=Math.max(hiY,v.y);
     }
+    const offset=v.set((hiX+loX)*.5,(hiY+loY)*.5,0).applyQuaternion(overhead.quaternion);
+    frame={target:centre.clone().add(offset),position:overhead.position.clone().add(offset),halfHeight:(hiY-loY)*.5,halfWidth:(hiX-loX)*.5};
+    views.set(view,frame);
   }
-  const offset=new THREE.Vector3((hiX+loX)*.5,(hiY+loY)*.5,0).applyQuaternion(overhead.quaternion);
-  controls.target.copy(centre).add(offset);overhead.position.add(offset);
-  overhead.userData.halfHeight=(hiY-loY)*.5;overhead.userData.halfWidth=(hiX-loX)*.5;
+  controls.target.copy(frame.target);overhead.position.copy(frame.position);
+  overhead.userData.halfHeight=frame.halfHeight;overhead.userData.halfWidth=frame.halfWidth;
 }
 function setView(next){
   view=next;ui.selectView(view);
@@ -203,21 +277,44 @@ function setView(next){
   cameraLocked=true;
   const interior=isEye(),wasEye=camera===eye;
   camera=interior?eye:overhead;controls.object=camera;
-  displayed.enclosure.group.visible=interior;street.visible=interior;
+  displayed.enclosure.group.visible=interior;street.visible=interior;contactShadow.visible=!interior;
   $('door').hidden=!interior||!displayed.leaf;
   camera.zoom=1;camera.up.set(0,1,0);
+  controls.enablePan=!interior;
+  const outside=view==='front'||view==='showcase';
+  controls.minAzimuthAngle=outside?-Math.PI*.38:-Infinity;
+  controls.maxAzimuthAngle=outside?Math.PI*.38:Infinity;
   if(interior){
     eye.position.fromArray(eyeViews[view].position);controls.target.fromArray(eyeViews[view].target);
     controls.maxPolarAngle=Math.PI*.87;
   }else{fitCutaway();controls.maxPolarAngle=Math.PI*.493;}
   camera.lookAt(controls.target);controls.update();cameraLocked=false;
-  resize();canvas.dataset.camera=view;
-  tracer?.invalidate(wasEye!==interior);requestDraw();
+  if(wasEye!==interior)renderer.shadowMap.needsUpdate=true;
+  refreshReflections();resize();canvas.dataset.camera=view;
+  tracer?.invalidate(wasEye!==interior);requestDraw(true);
+}
+function constrainEye(){
+  if(camera!==eye)return;
+  const outside=view==='front'||view==='showcase';
+  const p=eye.position, clamp=THREE.MathUtils.clamp;
+  // Keep orbital eye-level views on their own side of the shell and above
+  // the floor. The cutaway still permits full rotation and panning.
+  p.x=clamp(p.x,outside?-.80:.06,outside?3.25:view==='mezzanine'?5.06:2.39);
+  p.y=clamp(p.y,view==='mezzanine'&&p.x>2.45?1.48:.30,3.25);
+  p.z=clamp(p.z,outside?.30:-4.42,outside?4.35:-.055);
+  eye.lookAt(controls.target);eye.updateMatrixWorld();
 }
 function resize(){
   if(!renderer)return;
   const w=Math.max(1,stage.clientWidth),h=Math.max(1,stage.clientHeight),aspect=w/h;
-  renderer.setSize(w,h,false);live?.resize(w,h);
+  const scale=performanceMode==='fast'?.80:performanceMode==='fine'?Math.min(1.8,devicePixelRatio||1):Math.min(1.35,devicePixelRatio||1);
+  const changed=w!==lastWidth||h!==lastHeight||lastRatio!==scale;
+  if(changed){
+    if(scale!==lastRatio)renderer.setPixelRatio(scale);
+    renderer.setSize(w,h,false);live?.resize(w,h);
+    lastWidth=w;lastHeight=h;lastRatio=scale;
+    refreshReflections();
+  }
   eye.aspect=aspect;eye.fov=eyeViews[view]?.fov??57;
   if(aspect<.9)eye.fov+=Math.min(19,(.9-aspect)*50);
   eye.updateProjectionMatrix();
@@ -226,11 +323,13 @@ function resize(){
     const half=Math.max(overhead.userData.halfHeight*marginY,overhead.userData.halfWidth/aspect*marginX);
     overhead.top=half;overhead.bottom=-half;overhead.right=half*aspect;overhead.left=-overhead.right;
   }
-  overhead.updateProjectionMatrix();tracer?.resize();requestDraw();
+  overhead.updateProjectionMatrix();if(changed)tracer?.resize();requestDraw();
 }
-function exportPNG(){
+async function exportPNG(){
   if(!displayed){toast('The shop is still opening');return;}
-  if(quality==='live')live.draw();
+  if(editFrame){cancelAnimationFrame(editFrame);editFrame=0;}
+  if(canvas.dataset.settings!==JSON.stringify(state))await selectDesign();
+  if(quality==='live')live.draw(performanceMode!=='fast');
   canvas.toBlob(blob=>{
     if(!blob){toast('The browser could not export this view');return;}
     const link=document.createElement('a'),url=URL.createObjectURL(blob);
@@ -252,7 +351,7 @@ function setQuality(k){
 }
 function traceFailed(e){console.warn(e);quality='live';tracer?.stop();ui.quality('live');canvas.dataset.quality='live';toast('Using Live rendering. Ray tracing is unavailable on this device.');requestDraw();}
 function fail(e){
-  console.error(e);
+  console.error(e);ui.busy?.(false);
   status.hidden=false;status.className='fail';
   if(displayed){status.textContent='This design could not be displayed. Choose another finish or lighting layout.';return;}
   $('fallback').src='data:image/jpeg;base64,'+$('poster').textContent.trim();$('fallback').hidden=false;
@@ -260,19 +359,19 @@ function fail(e){
   document.querySelectorAll('button,input,select').forEach(b=>b.disabled=true);
 }
 async function main(){
-  ui=initUI({current:()=>state,change,camera:setView,zoom,reset:()=>setView(view),exportPNG,quality:setQuality});
+  ui=initUI({current:()=>state,change,camera:setView,zoom,reset:()=>setView(view),exportPNG,quality:setQuality,performance:performanceSetting});
   ui.sync(state);ui.selectView(view);canvas.dataset.quality='live';$('door').onclick=toggleDoor;
   packed=JSON.parse($('modelData').textContent);
   renderer=new THREE.WebGLRenderer({canvas,antialias:true,powerPreference:'high-performance',preserveDrawingBuffer:true});
-  renderer.setPixelRatio(Math.min(1.65,window.devicePixelRatio||1));
+  canvas.dataset.performance=performanceMode;
   renderer.outputColorSpace=THREE.SRGBColorSpace;renderer.toneMapping=THREE.ACESFilmicToneMapping;
-  renderer.shadowMap.enabled=true;renderer.shadowMap.type=THREE.PCFSoftShadowMap;
+  renderer.shadowMap.enabled=true;renderer.shadowMap.autoUpdate=false;renderer.shadowMap.needsUpdate=true;renderer.shadowMap.type=THREE.PCFSoftShadowMap;
   // The display transform brings this studio charcoal to the interface's #151a19.
   scene.background=new THREE.Color(0x272c2b);
   scene.environment=daylightEnvironment();
   controls=new OrbitControls(camera,canvas);controls.enableDamping=false;controls.minZoom=.5;controls.maxZoom=6;
   controls.minDistance=.4;controls.maxDistance=25;controls.rotateSpeed=.72;
-  controls.addEventListener('change',()=>{if(!cameraLocked){tracer?.invalidate(false);requestDraw();}});
+  controls.addEventListener('change',()=>{if(!cameraLocked){constrainEye();refreshReflections();tracer?.invalidate(false);requestDraw(true);}});
   hemisphere=new THREE.HemisphereLight(0xf3f5ef,0xcdbda6,1);
   sun=new THREE.DirectionalLight(0xfff2db,1);sun.position.set(-3.4,10.8,3.3);sun.target.position.set(2,.3,-3);
   sun.castShadow=true;sun.shadow.mapSize.set(2048,2048);
@@ -280,7 +379,8 @@ async function main(){
   sun.shadow.normalBias=.009;sun.shadow.bias=-.00021;scene.add(hemisphere,sun,sun.target);
   live=liveRendering(renderer,scene,()=>camera);
   street=await streetView();street.visible=false;scene.add(street);
-  const ground=new THREE.Mesh(new THREE.PlaneGeometry(100,100),new THREE.ShadowMaterial({opacity:.17}));ground.name='Studio ground';ground.rotation.x=-Math.PI/2;ground.position.y=-.35;ground.receiveShadow=true;scene.add(ground);
+  contactShadow=studioContact();scene.add(contactShadow);
+  const ground=new THREE.Mesh(new THREE.PlaneGeometry(100,100),new THREE.ShadowMaterial({opacity:.17}));ground.name='Studio ground';ground.layers.set(3);ground.rotation.x=-Math.PI/2;ground.position.y=-.35;ground.receiveShadow=true;scene.add(ground);
   canvas.onkeydown=e=>{
     if(!displayed||!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','+','=','-'].includes(e.key))return;e.preventDefault();
     if(['+','=','-'].includes(e.key)){zoom(e.key==='-'?.85:1.18);return;}
@@ -290,6 +390,16 @@ async function main(){
     sph.phi=THREE.MathUtils.clamp(sph.phi,.001,controls.maxPolarAngle);
     camera.position.copy(controls.target).add(new THREE.Vector3().setFromSpherical(sph));controls.update();
   };
+  canvas.addEventListener('webglcontextlost',event=>{
+    event.preventDefault();clearTimeout(redrawTimer);
+    status.hidden=false;status.textContent='Restoring the 3D view…';
+  });
+  canvas.addEventListener('webglcontextrestored',()=>{
+    if(tracer){tracer.dispose();tracer=null;}
+    quality='live';ui.quality('live');canvas.dataset.quality='live';
+    renderer.shadowMap.needsUpdate=true;refreshReflections();
+    status.hidden=!!displayed;requestDraw();
+  });
   new ResizeObserver(resize).observe(stage);resize();await selectDesign();
 }
 main().catch(fail);

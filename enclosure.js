@@ -61,6 +61,8 @@ function measureShell() {
     [1.2,.45,-4.95,1.289,h,-4.60],
     [1.2,0,-7.32,1.289,.84,-6.42],[1.2,2.20,-7.32,1.289,h,-6.42],
     [1.2,2.14,-6,1.289,h,-4.95],[0,0,-7.78,1.2,h,-7.687],
+    // Close the street face below the raised slab in eye-level views. The cutaway retains its open underside.
+    [2.45,-.35,0,5.15,1.18,.09],
     // Mezzanine floor is +1.350 m. Preserve both measured windows.
     [2.45,1.82,-4.60,5.15,h,-4.5],
     [5.15,1.82,-4.50,5.24,h,-4.25],[5.15,1.82,-2.45,5.24,h,0],
